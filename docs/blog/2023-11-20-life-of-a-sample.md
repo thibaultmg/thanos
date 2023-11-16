@@ -210,35 +210,48 @@ EXPLAIN HOW IT WORKS. EXPLAIN CONFIGURATION. EXPLAIN RECOMMENDATIONS.
 
 #### Metrics terminology: Samples, Labels and Series
 
-* **Sample**: In the context of Prometheus, a sample is a data point representing a measurement of a dynamic system aspect or property at a specific moment in time. 
-* **Labels** Each sample in Prometheus is associated with a set of labels, which are key-value pairs that provide details about:
+* **Sample**: A sample in Prometheus represents a single data point, capturing a measurement of a specific system aspect or property at a given moment. It's the fundamental unit of data in Prometheus, reflecting real-time system states.
+* **Labels** very sample in Prometheus is tagged with labels, which are key-value pairs that add context and metadata. These labels typically include:
 
-  * The property being measured
-  * Its source or origin
-  * Additional contextual information
+  * The nature of the metric being measured.
+  * The source or origin of the metric.
+  * Other relevant contextual details.
 
-* **External labels**: External labels are not defined by the source of the sample but are added on top by the component scraping or receiving the data. DEVELOP
+* **External labels**: External labels are appended by the scraping or receiving component (like a Prometheus server or Thanos Receive). They enable:
 
-* **Series**: A series is defined by a unique combination of labels and their values. To illustrate, here's an example of a series representation:
+  * Sharding: Included in the `meta.json` file of the block created by Thanos, these label are used by the compactor and the store to shard blocks processing effectively.
+  * Deduplication: In high-availability setups where Prometheus servers scrape the same targets, external labels help identify and deduplicate similar samples.
+  * Tenancy isolation: In multi-tenant systems, external labels are used to segregate data per tenant, ensuring logical data isolation.
+
+* **Series** or **Time Series**: In the context of monitoring, a Series, which is a more generic term is necessarily a time series. A series is defined by a unique set of label-value combinations. For instance:
 
 ```
-http_requests_total{method="GET", handler="/users", status="200"} 
-    ^                                        ^                            
-The series name               labels in the form label=value                        
+http_requests_total{method="GET", handler="/users", status="200"}
+^                                        ^
+Series name (label `__name__`)           Labels (key=value format)                     
 ```
 
-In this case, the series name (http_requests_total) is effectively a specific label named `__name__`. The unique set of labels and values collectively identifies a series.
-
-* **Time Series**: Prometheus scrapes these samples, attaching a timestamp to each value. As the system evolves, these values change, and Prometheus continues to scrape new samples over time, forming a time series.
+In this example, http_requests_total is a specific label (`__name__`). The unique combination of labels creates a distinct series. Prometheus scrapes these series, attaching timestamps to each sample, thereby forming a dynamic time series.
 
 For our discussion, samples can be of various types, but we'll treat them as simple integers for simplicity.
 
-#### TSDB terminology: Blocks, Chunks, indexes
+The following schema illustrates the relationship between samples, labels and series:
 
-TSDB stores Series for fast read access, low data expansion. DESCIBE TSDB, DESIGN CONSTRAINTS, 120 SANPLES FORMS A BLOCK, BLOCKS ARE AGGREGATED INTO??ALL THIS IS INDEXED...
+![Series terminology](img/life-of-a-sample/series-terminology.png)
 
-#### Object store format
+#### TSDB terminology: Chunks, Chunk Files and Blocks
 
+Thanos adopts its [storage architecture](https://thanos.io/tip/thanos/storage.md/#data-in-object-storage) from [Prometheus](https://prometheus.io/docs/prometheus/latest/storage/), utilizing the TSDB (Time Series Database) [file format](https://github.com/prometheus/prometheus/blob/release-2.48/tsdb/docs/format/README.md) as its foundation. Let's review some key terminology that is needed to understand some of the configuration options.
+
+**Samples** from a given time series are first aggregated into small **chunks**. The storage format of a chunk is highly compressed ([see documentation](https://github.com/prometheus/prometheus/blob/release-2.48/tsdb/docs/format/chunks.md#xor-chunk-data)). Accessing a given sample of the chunk requires decoding all preceding values stored in this chunk. This is why chunks hold up to 120 samples, a number chosen to strike a balance between compression benefits and the performance of reading data.
+
+Chunks are created over time for each time series. As time progresses, these chunks are assembled into **chunk files**. Each chunk file, encapsulating chunks from various time series, is limited to 512MiB to manage memory usage effectively during read operations. Initially, these files cover a span of two hours and are subsequently organized into a larger entity known as a **block**. 
+
+A **block** is a directory containing the chunk files in a specific time range, an index and some metadata. The two-hour duration for initial blocks is chosen for optimizing factors like storage efficiency and read performance. Over time, these two-hour blocks undergo horizontal compaction by the compactor, merging them into larger blocks. This process is designed to optimize long-term storage by extending the time period each block covers.
+
+The following schema illustrates the relationship between chunks, chunk files and blocks:
+
+![Storage terminology](img/life-of-a-sample/storage-terminology.png)
 
 #### Configuration Options Summary
 
