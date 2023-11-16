@@ -53,15 +53,26 @@ The Prometheus remote-write configuration offers various parameters to tailor co
 
 Implementation-wise for Prometheus, the key idea is to read directly from the TSDB WAL (Write Ahead Log), a simple mechanism commonly used by databases to ensure data durability. If you wish to delve deeper into the TSDB WAL, check out this [great article](https://ganeshvernekar.com/blog/prometheus-tsdb-wal-and-checkpoint). Once samples are extracted from the WAL, they are aggregated into parallel queues (shards) as remote-write payloads. When a queue reaches its limit or a maximum timeout is attained, the remote-write client stops reading the WAL and dispatches the data. The cycle continues. The parallelism is defined by the number of shards, their number is dynamically optimized. More insights on Prometheus' remote write tuning can be found [here](https://prometheus.io/docs/practices/remote_write/).
 
-<!-- TODO: add diagram showing the parameters influence over the protocol, explain tradeoffs, show sensible config, explain external labels management? -->
+Key Points to Consider:
 
-#### Protecting the receiver from abusive usage
+* **Send deadline setting**: `batch_send_deadline` should be set to arround 5s to minimize latency. This timeframe strikes a balance between minimizing latency and avoiding excessive request frequency that could burden the receiver. While a 5-second delay might seem substantial in critical alert scenarios, it's generally acceptable considering the typical resolution time for most issues.
+* **Backoff settings**: The `min_backoff` should ideally be no less than 250 milliseconds, and the `max_backoff` should be at least 10 seconds. These settings help prevent receiver overload, particularly in situations like system restarts, by controlling the rate of data sending.
 
-As you cannot control the configuration of your clients, you must protect yourselft from abusive usage. To that effect the Receive component offers a few configuration options that are well described in the [documentation](https://thanos.io/tip/components/receive.md/#limits--gates-experimental). Here is a schema illustrating the impact of these options:
+#### Protecting the receiver from overuse
 
-<!-- SCHEMA -->
+In scenarios where you have limited control over client configurations, it becomes essential to shield the Receive component from potential misuse or overload. The Receive component includes several configuration options designed for this purpose, comprehensively detailed in the [official documentation](https://thanos.io/tip/components/receive.md/#limits--gates-experimental). Below is a diagram illustrating the impact of these configuration settings:
 
-DO CLIENTS SUPPORT 429? WHAT HAPPENS IF A CLIENT SENDS TWICE THE SAME DATA? CONFLICT? IS IT SUPPORTED BY CLIENTS? TALK ABOUT OUT OF ORDER HERE?
+<img src="img/life-of-a-sample/receive-limits.png" alt="Receive limits" width="900"/>
+
+When implementing a topology with separate router and ingestor roles, these limits should be enforced at the router level.
+
+Key points to consider:
+
+* **Series and samples limits**: Typically, with a standard target scrape interval of 15 seconds and a maximum remote write delay of 5 seconds, the `series_limit` and `samples_limit` tend to be functionally equivalent. However, in scenarios where the remote writer is recovering from downtime, the `samples_limit` may become more restrictive, as the payload might include multiple samples for the same series.
+* **Handling request rimits**: If a request exceeds these limits, the system responds with a 413 (Entity Too Large) HTTP error. Presently, Prometheus does not support splitting requests in response to this error, which leads to data loss.
+* **Active series limiting**: The limitation on active series persists as long as the count remains above the set threshold in the receivers' TSDB. The number of active series decreases when data is deleted in accordance with the `--tsdb.retention` setting. Consequently, longer retention periods can prolong the duration of incoming data rejection, potentially causing data loss if it exceeds the client’s WAL retention time. Requests reching this limit are rejected with 429 (Too Many Requests) HTTP code, triggering retries.
+
+Considering these aspects, it is importamt to carefully monitor and adjust these limits. While they serve as necessary safeguards, overly restrictive settings can inadvertently lead to data loss. 
 
 ### Receiving samples with High Availability and Durability 
 
@@ -91,18 +102,18 @@ We recommend using the Ketama hashring (--receive.hashrings-algorithm flag) for 
 
 When the hashring configuration changes, Receive instances need to flush data to object storage EVEN WITH KETAMA??. During that time, the Receive replies with 503 to the clients which is interpreted as a temporary failure and remote-writes are retried. At that moment, your receive will have to catch up and receive a lot of data. This is why we recommend using the `--receive.limits-config` flag to limit the amount of data that can be received. This will prevent the receive from being overwhelmed by the catch up. 
 
-#### Improving Scalability and Reliability
-
-To address the challenges in scalability and reliability, a new deployment topology was [proposed](https://thanos.io/tip/proposals-accepted/202012-receive-split.md/), separating the **router** and **ingestor** roles. Routers now manage the hashring, directing data to appropriate ingestors. This approach simplifies scaling and reduces downtime.
-
-<!-- EXPLAIN CONFIGURATION AND DO SCHEMA -->
+EXPLAIN HOW TO SETUP NODES LIST, TALK ABOUT DNS DISCOVERY
 
 #### Ensuring Samples Durability
 
 For clients requiring high data durability, the `--receive.replication-factor` flag ensures data duplication across multiple receivers. When set to n, it will only reply a succesful processing to the client once it has duplicated the data to `n-1` other receivers. Additionally, an external replicas label can be added to each Receive instance (`--label` flag) to mark replicated data. This setup increases data resilience but also expands the data footprint. 
 HOW DOES IT PLAYS WITH `--receive.replica-header`?
 
-<!-- DO SCHEMA -->
+#### Improving Scalability and Reliability
+
+To address the challenges in scalability and reliability, a new deployment topology was [proposed](https://thanos.io/tip/proposals-accepted/202012-receive-split.md/), separating the **router** and **ingestor** roles. Routers now manage the hashring, directing data to appropriate ingestors. This approach simplifies scaling and reduces downtime.
+
+<img src="img/life-of-a-sample/router-and-ingestor.png" alt="IngestorRouter" width="350"/>
 
 ### Preparing samples for object storage: building chunks and blocks
 
@@ -280,24 +291,3 @@ Summary of the listed configuration options of the Receive component:
 | `--grpc-address` | The store API endpoint |
 | `--store.limits.request-samples`
   `--store.limits.request-series` | Limits on the store API |
-
-
-
-### Receiving the samples in Thanos: the receive component
-
-Now let’s get back to our receiver. It’s objective is to aggregate the samples into blocks that can be sent to the object storage. To do that, data will be retained 2 hours before being shipped directly to the object storage. This is CONFIGURED WITH…
-2 hours is a long time. This data must be made accessible quickly for forcessing queries. This is the role of the thanks API EXPLAIN, SHOW CONFIGURATION. There is also a configuration that states how long this data is kept by the receive and made accessible through the store API. EXPLAIN TRRADEOFFS
-One unique receiver is responsible for collecting data of a given metric to be able to compact and serve it with performance. TALK ABOUT HASHRING 
-The receive must also offer guaranties to the client sending the samples. To that effect, the data can be replicated EXPLAIN HOW IT WORKS AND RELATED CONFIGURATION.
-It must protect himself from abusive usage with LIMITS
-But receivers start having a lot of work. They have both an ingesting role and a routing role. They are called IngestorRouter. To reduce their work, this rFC introduced the possibility to split routers and receivers.
-Data received needs to be identified by adding an external label ELABORATE.
-TALK ABOUT DATA EXPANSION WHEN HA PROMETHEUS PLUS REPLICATION.REPLICA AND PROMETHEUS_REPLICA labels
-
-The issue is that we duplicated the data in the store. Plus on restarts, some partial blocks are sent. Someone needs to take the responsibility for cleaning this building mess. This is the role of the compactor. EXPLAIN UI, READ OPTIMISATION FOR LONG QUERIES, RAPLICA DEDUP, HA DEDUP, LEVELS…
-
-Houra, our samples are ingested, stored in the object store and maintained in shape. We now need to make them accessible for queries and rules evaluations. This is the role of the store that acts as q facade for any type of object store. It needs access to the object store and exposes data through the thanks API. HOW DOES IT RETRIEVES DATA? INDEXES, USE OF CACHES. MAKE RECOMMANDATIONS ON CACHES. Retrieving data from buckets is expensive, proactive caching.HOW TO OBSERVE. WHAT meMORY AND Cpu.
-
-The thanks stores expose raw samples data. They are not able to evaluate queries. This is the role of the query. It runs the ENGINE that will retrieve data in thanks stores by fanning out requests DETAIL REQUEST AND PAYLOAD. Once the data is retrieved, data processing according to the query is made. DETAIL hOW Much mEMORY AND CPU. Queries can handle lots of data. Some data it retrieves has not been yet deduplicated  EXPLAIN CONFIG. Some queries span long times, TALK ABOUT COMPACTION.
-Finally sharding is possible with query frontend. Also VOLCANO ENGINE WITH CONFIG AND HTTP PORTS. Talks about noisy neighbours protection WITHqUERY RULER sPLIT & LIMITS
-What if I want to logically isolate the data for multi tenant setups?
