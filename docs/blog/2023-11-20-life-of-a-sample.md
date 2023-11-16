@@ -76,9 +76,9 @@ Relying on a single instance of Thanos Receive is not sufficient for two main re
 
 To achieve high availability, it is necessary to deploy multiple receive replicas. However, it's not just about having more instances; it's crucial to maintain consistency in sample ingestion. In other words, samples from a given time series must always be ingested be the same Receive instance. This consistency is key for constructing chunks and blocks, as we'll discuss later. 
 
-To that effect, you guessed it, the receive uses a hashring! With the hashring, every Receive participant knows and agrees on who must ingest what sample. When clients send data, they connect to any Receive instance, which then routes the data to the correct instance based on the hashring. This is why the Receive component is also known as the **IngestorRouter**.
+To that effect, you guessed it, the receive uses a hashring! With the hashring, every Receive participant knows and agrees on who must ingest what sample. When clients send data, they connect to any Receive instance, which then routes the data to the correct instances based on the hashring. This is why the Receive component is also known as the **IngestorRouter**.
 
-<!-- Schema -->
+<img src="img/life-of-a-sample/ingestor-router.png" alt="IngestorRouter" width="350"/>
 
 Receive instances use a gossip protocol to maintain a consistent view of the hashring, requiring inter-instance communication via a configured HTTP server (`--http-address` flag).
 
@@ -140,20 +140,27 @@ The Receive component implements many strategies to ingest samples reliably. How
 * Duplicated data when replication is set.  Several Receive instances will send the same data to object storage.
 * Incompete blocks (invalid blocks) sent to object storage when the receive fails in the middle of an upload.
 
+The following schema illustrates the impact on data expansion (6 times) in object storage when samples from a given target are ingested from a high availabity prometheus setup (with 2 instances) and repliacation (factor 3) is set on the receive:
+
+<img src="img/life-of-a-sample/data-expansion.png" alt="Data expansion" width="400"/>
+
 The Compactor component is responsible for maintaining and optimizing data in object storage. It's a long-running process that can be configured to wait for new blocks with the `--wait` flag. It also needs access to the object storage with the `--objstore.config` flag.
+
+#### Compaction modes
 
 Compaction consist in merging blocks that have overlapping time ranges. This is called **horizontal compaction** Using the Metadata file that contains the minimum and maximum timestamp of samples in the block, the compactor can determine if two blocks overlap. If they do, they are merged into a new block. This new block will have its compaction level index increased by one. So from two blocks of 2 hours each having a small overlap, we will get a new block of 4 hours. 
 
-<!-- Schema -->
-
-During this compaction, the compactor will also deduplicate samples. This is called **vertical compaction**. Because as we've seen with the compactor, the incoming data if often times deuplicated for durability. On top of that, it might be coming from high availability prometheus setups where two prometheus servers are scraping the same targets. Let see how it looks like on the object storage:
-
-<!-- Schema with one sample coming in two HA prom and then replicated 3x by receive -->
-
-The compactor provides two deduplication modes:
+During this compaction, the compactor will also deduplicate samples. This is called **vertical compaction**. The compactor provides two deduplication modes:
 
 * `one-to-one`: This is the default mode. It will deduplicate samples that have the same timestamp and the same value. But different replica label values. The replica label is configured by the `--deduplication.replica-label` flag REALLY?. Usually set to `replica`, make sure it is set up as external label on the receivers. The benefit of this mode is that it is straightforward and will remove replicated data from the receive. However, it is not able to remove data replicated by high availability prometheus setups. Because, these samples will rarely be scraped at exactly the same timestamps.
-* `penalty`: This a more complex deduplication algorithm that is able to deduplicate data coming from high availability prometheus setups. It can be set with the `--deduplication.func` flag and requires also setting the `--deduplication.replica-label` flag that identifies the label that contains the replica label. Usually `prometheus_replica`.
+* `penalty`: This a more complex deduplication algorithm that is able to deduplicate data coming from high availability prometheus setups. It can be set with the `--deduplication.func` flag and requires also setting the `--deduplication.replica-label` flag that identifies the label that contains the replica label. Usually `prometheus_replica`. Here is a schema illustrating how Prometheus replicas generate samples with different timestamps that cannot be deduplicated with the `one-to-one` mode:
+
+<img src="img/life-of-a-sample/ha-prometheus-duplicates.png" alt="High availability prometheus duplication" width="400"/>
+
+Getting back to our example illustrating the data duplication happening in the object storage, here is how each compaction process will impact the data:
+
+<img src="img/life-of-a-sample/compactor-compaction.png" alt="Compactor compaction" width="400"/>
+
 
 You want to deduplicate data as much as possible because it will lower your object storage cost and improve query performance. But using the penalty presents some limitations. Have a look at (https://thanos.io/tip/components/compact.md/#vertical-compaction-risks)
 
@@ -276,3 +283,21 @@ Summary of the listed configuration options of the Receive component:
 
 
 
+### Receiving the samples in Thanos: the receive component
+
+Now let’s get back to our receiver. It’s objective is to aggregate the samples into blocks that can be sent to the object storage. To do that, data will be retained 2 hours before being shipped directly to the object storage. This is CONFIGURED WITH…
+2 hours is a long time. This data must be made accessible quickly for forcessing queries. This is the role of the thanks API EXPLAIN, SHOW CONFIGURATION. There is also a configuration that states how long this data is kept by the receive and made accessible through the store API. EXPLAIN TRRADEOFFS
+One unique receiver is responsible for collecting data of a given metric to be able to compact and serve it with performance. TALK ABOUT HASHRING 
+The receive must also offer guaranties to the client sending the samples. To that effect, the data can be replicated EXPLAIN HOW IT WORKS AND RELATED CONFIGURATION.
+It must protect himself from abusive usage with LIMITS
+But receivers start having a lot of work. They have both an ingesting role and a routing role. They are called IngestorRouter. To reduce their work, this rFC introduced the possibility to split routers and receivers.
+Data received needs to be identified by adding an external label ELABORATE.
+TALK ABOUT DATA EXPANSION WHEN HA PROMETHEUS PLUS REPLICATION.REPLICA AND PROMETHEUS_REPLICA labels
+
+The issue is that we duplicated the data in the store. Plus on restarts, some partial blocks are sent. Someone needs to take the responsibility for cleaning this building mess. This is the role of the compactor. EXPLAIN UI, READ OPTIMISATION FOR LONG QUERIES, RAPLICA DEDUP, HA DEDUP, LEVELS…
+
+Houra, our samples are ingested, stored in the object store and maintained in shape. We now need to make them accessible for queries and rules evaluations. This is the role of the store that acts as q facade for any type of object store. It needs access to the object store and exposes data through the thanks API. HOW DOES IT RETRIEVES DATA? INDEXES, USE OF CACHES. MAKE RECOMMANDATIONS ON CACHES. Retrieving data from buckets is expensive, proactive caching.HOW TO OBSERVE. WHAT meMORY AND Cpu.
+
+The thanks stores expose raw samples data. They are not able to evaluate queries. This is the role of the query. It runs the ENGINE that will retrieve data in thanks stores by fanning out requests DETAIL REQUEST AND PAYLOAD. Once the data is retrieved, data processing according to the query is made. DETAIL hOW Much mEMORY AND CPU. Queries can handle lots of data. Some data it retrieves has not been yet deduplicated  EXPLAIN CONFIG. Some queries span long times, TALK ABOUT COMPACTION.
+Finally sharding is possible with query frontend. Also VOLCANO ENGINE WITH CONFIG AND HTTP PORTS. Talks about noisy neighbours protection WITHqUERY RULER sPLIT & LIMITS
+What if I want to logically isolate the data for multi tenant setups?
