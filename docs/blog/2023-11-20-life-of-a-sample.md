@@ -27,7 +27,9 @@ The sample usually originates from a Prometheus instance that is scraping target
 * The **Prometheus instances are under your control and you can access it from your Thanos deployment**. In this case you can use the Thanos sidecar that you will attach the the pod running the prometheus server. The Thanos sidecar will read directly the samples from the Prometheus server using the read API. Then the sidecar will behave similarly to the other scenario without the routing and ingestion parts. Thus we will not go further into this use case.
 * The **Prometheus servers are running in clusters that you do not control**. You'll often hear air gapped clusters. In this case, you cannot attach a sidecar to the Prometheus server. The samples will trvel to your Thanos system using the remote write protocol. This is the scenario we will focus on.
 
-![Thanos integration with data source](img/life-of-a-sample.png)
+The following schema illustrates the two scenarios:
+
+<img src="img/life-of-a-sample/close-integration.png" alt="Close integration vs external client" width="400"/>
 
 Comparing the two deployment modes, the Sidecar Mode is generally preferable due to its simpler configuration and fewer moving parts. However, if this isn't possible, opt for the **Receive Mode**. Bear in mind, this mode requires careful configuration to ensure high availability, scalability, and durability. It adds another layer of indirection and comes with the overhead of operating the additional component.
 
@@ -237,7 +239,7 @@ For our discussion, samples can be of various types, but we'll treat them as sim
 
 The following schema illustrates the relationship between samples, labels and series:
 
-![Series terminology](img/life-of-a-sample/series-terminology.png)
+<img src="img/life-of-a-sample/series-terminology.png" alt="Series terminology" width="500"/>
 
 #### TSDB terminology: Chunks, Chunk Files and Blocks
 
@@ -251,7 +253,7 @@ A **block** is a directory containing the chunk files in a specific time range, 
 
 The following schema illustrates the relationship between chunks, chunk files and blocks:
 
-![Storage terminology](img/life-of-a-sample/storage-terminology.png)
+<img src="img/life-of-a-sample/storage-terminology.png" alt="TSDB terminology" width="900"/>
 
 #### Configuration Options Summary
 
