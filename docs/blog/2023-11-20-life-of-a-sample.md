@@ -177,15 +177,17 @@ Getting back to our example illustrating the data duplication happening in the o
 
 You want to deduplicate data as much as possible because it will lower your object storage cost and improve query performance. But using the penalty presents some limitations. Have a look at (https://thanos.io/tip/components/compact.md/#vertical-compaction-risks)
 
-#### The compactor UI
+#### The compactor UI and the block streams
 
 The Compactor's operation can be monitored via the Block Viewer UI, accessible through a web interface configured with the `--http-address` flag. Additional UI settings are controlled via `--web.*` and `--block-viewer.*` flags. Here is how it looks like:
+
+EXPLAIN DATA STREAMS
 
 <!-- Print screen with overlay explaining -->
 
 #### Downsampling and retention
 
-The compactor is also optimizing data read for long range queries. If you are querying data for several months, you don't need the typical 15s raw resolution. Processing such a query will be very inefficient as it will retrieve a lot of unnecessary data. To enable performant long range queries, the compactor can downsample data. It supports two downsampling levels: 5m and 1h. These are the resolution of the downsamples series. They will tipically come on top of the raw data, so that you can have both raw and downsampled data. DETAILS. We'll see later how to configure the query to use the downsampled data.
+The compactor is also optimizing data read for long range queries. If you are querying data for several months, you don't need the typical 15s raw resolution. Processing such a query will be very inefficient as it will retrieve a lot of unnecessary data. To enable performant long range queries, the compactor can downsample data. It supports two downsampling levels: 5m and 1h. These are the resolution of the downsamples series. They will tipically come on top of the raw data, so that you can have both raw and downsampled data. We'll see later how to configure the query to use the downsampled data.
 
 Finally you can configure how long you want to retain your data on object storage. One flag `--retention.resolution-*` for each resolution is available. We recommand having the same value for each. 
 
@@ -193,7 +195,7 @@ Finally you can configure how long you want to retain your data on object storag
 
 #### Exposing data for queries
 
-HOW DOES THE STORE KNOWS NEW BLOCKS ARE AVAILABLE? WHAT DELAY? SYNC MECHANISMS WITH THE RECEIVE
+HOW DOES THE STORE KNOWS NEW BLOCKS ARE AVAILABLE? WHAT DELAY? SYNC MECHANISMS WITH THE RECEIVE? CAN THE CACHE BECOME INVALID?
 
 The Store Gateway is acting as a facade for the object storage, making bucket data accessible via the Thanos Store API, a feature first introduced with the Receive component. The store exposes the store API with the `--grpc-address` flag.
 
@@ -235,29 +237,98 @@ The Store Gateway processes this request in several steps:
   * Retrieving the Series section from the index for these series, which includes chunk information and their time ranges. Example:
     * Series 1: [Chunk 1: mint=t0, maxt=t1, fileRef=0001, offset=0], ...
   * Determining the relevant chunks based on their time range intersection with the query.
-* **Chunks retrieval**: The Gateway then fetches the appropriate chunks, either from the object storage directly or from a chunk cache. When retrieving from the object store, the Gateway leverages its API to read only the needed bytes (e.g. using S3 range requests), bypassing the need to download entire chunk files.
+* **Chunks retrieval**: The Gateway then fetches the appropriate chunks, either from the object storage directly or from a chunk cache. When retrieving from the object store, the Gateway leverages its API to read only the needed bytes (i.e. using S3 range requests), bypassing the need to download entire chunk files. Then, the gateway streams selected chunks to the Querier.
 
 Understanding the retrieval algorithm highlights the critical role of an external [index cache](https://thanos.io/tip/components/store.md/#index-cache) in the Store Gateway's operation. This is configured using the `--index-cache.config` flag. Indexes contain all labels and values of the block which can result in big sizes. When the cache is full, Last-In-First-Out (LIFO) eviction is applied. In scenarios where no external cache is configured, a portion of the memory will be utilized as a cache, managed via the `--index-cache.size` flag.
 
 Moreover, the direct retrieval of chunks from object storage can be suboptimal, and result in excessive costs, especially with a high volume of queries. To mitigate this, employing a [caching bucket](https://thanos.io/tip/components/store.md/#caching-bucket) can significantly reduce the number of queries to the object storage. This chunk caching strategy is particularly effective when data access patterns are predominantly focused on recent data. By caching these frequently accessed chunks, query performance is enhanced, and the load on object storage is reduced.
 
-#### Distributing the load with sharding
+#### Enhancing Store Performance through Sharding
 
-Stores performance can be improved by controlling the concurrency level. Sharding can also be configured using relabel configuration. EXPAND ON THAT.
+The performance of Thanos Store components can be notably improved by managing concurrency and implementing sharding strategies.
 
-### Querying data: the engine, limits, and ruler split
+Adjusting the level of concurrency can have a significant impact on performance. This is managed through the `--store.grpc.series-max-concurrency` flag for the allowed concurrent series requests on the store API. Other lower level concurrency settings are also available.
 
-All our data is ingested, maintained and made available for querying. The Querier component will be responsible for retrieving data from the store and processing it according to the query. 
+After having optimized the store processing, you can distribute the queries load using sharding strategies enabled by the relabel configuration. This approach involves processing different blocks on different Store instances. Here’s an example of how to set up sharding using the `--selector.relabel-config` flag:
 
-TWO QUERY EVELUATION ENGINES: PROMQL AND VOLCANO. EXPLAIN TRADEOFFS. EXPLAIN CONFIGURATION. EXPLAIN VOLCANO HTTP PORTS. EXPLAIN NOISY NEIGHBOURS PROTECTION. EXPLAIN QUERY RULER SPLIT AND LIMITS.
+```yaml
+- action: hashmod
+  source_labels:
+    - __block_id
+  target_label: shard
+  modulus: 2 # number of store replicas
+- action: keep
+  source_labels:
+    - shard
+  regex: 0 # shard number
+```
 
-### Scaling queries by sharing the load: the query frontend
+In this configuration, the `hashmod` action is used to distribute blocks across multiple Store instances (replicas) based on the `__block_id` label. The `modulus` should match the number of Store replicas you have. Each replica will then keep only the blocks that match its shard number, as defined by the `regex` in the `keep` action. This setup allows for a more balanced distribution of query processing, enhancing overall system performance. 
 
-TALK ALSO ABOUT THE THANOS ENGINE?
+However, this sharding approach isn't a universal solution. One potential issue comes from the fact that series are grouped within a block based on their external labels, typically originating from the same data source. In such cases, if the load is predominantly from one source, sharding may be less effective. This is especially true for blocks that have undergone horizontal compaction and cover extensive time ranges, potentially resulting in an uneven query load on a single Store instance. OTHER SOLUTION? ADD RANDOM SET OF EXTERNAL LABELS AT THE SERIES LEVEL TO INCREASE THE NUMBER OF STREAMS?
 
-### Logical isolation of data: multi-tenancy
+### Querying data from the Thanos stores: the querier
 
-EXPLAIN HOW IT WORKS. EXPLAIN CONFIGURATION. EXPLAIN RECOMMENDATIONS.
+#### Configuring Samples Access in the Querier
+
+The Querier component in Thanos is entry point for samples retrieval. It is responsible for processing PromQL queries. This process involves:
+
+* Parsing the query.
+* Fetching data from Thanos stores.
+* Processing and returning the query result.
+
+Thanos stores, comprising the Receive component for recent data and the Store Gateway for older records, are configured using  the `--endpoint*` flags. As the Querier is unaware of which store owns what data, it distributes requests across all configured stores. 
+
+<!-- schema -->
+
+To prevent data overlap between the Receive component (handling data up to its TSDB retention period) and the Store Gateway (handling blocks exported to the object store), the `--max-time` flag is used in the Store Gateway. This flag ensures the Store Gateway does not serve data too recent and already covered by the Receive. However, a slight overlap is necessary to prevent data gaps:
+
+<!-- schema -->
+
+#### Deduplication and Partial Response Handling
+
+The Querier receives data that may be duplicated. This can be the case when:
+
+* The Receive component is configured with replication and recent data is requested. The query will receive the same data from multiple Receive instances as it fans out its requests to all Thanos stores.
+* Some data is served by both the receive and the store gateway when the query time range overlaps with common time ranges served by both components.
+* Some data come from high availability prometheus setups.
+
+As a result, the querier may receive duplicated data from the receivers in case of duplication or high availability setups upstream. This is why the querier will deduplicate data before processing the query. Deduplicating data from high availability prometheusis requires setting the flag `--query.replica-label` to the label identifying replicas (commonly prometheus_replica). It uses the same algorithm as the compactor.
+
+In a distributed environment, not all stores may successfully retrieve necessary samples. If partial responses occur, the behavior is controlled by `--query.partial-response`. By default, queries are aborted on partial responses, a sensible default for rule evaluations. However, for ad-hoc queries where availability is prioritized over consistency, setting --query.partial-response=warn allows the query to proceed with warnings visible in the Thanos Query UI, exposed by the Querier. It is the same as the Prometheus UI, adapted to Thanos.
+
+WHY ARE THERE STORE API SETTINGS?
+
+#### Downsampling and Query Efficiency
+
+The Querier also dictates the level of downsampling permitted to the Store Gateway. Downsampling is disabled by default but can be enabled with `--query.auto-downsampling` on the Querier. The UI or tools like Grafana automatically calculate an appropriate 'step' for queries, influencing the `max_resolution_window` parameter in store API requests. For long-range queries, this feature enhances efficiency by reducing the volume of data processed, facilitating pattern detection over extended periods. Once a pattern is identified, zooming in provides more detailed data. Therefore, it is recommended to maintain equal retention for both raw and downsampled data for a comprehensive analysis range.
+
+Let's see two examples of how the Querier handles downsampling:
+
+* **A one hour range query**: Commonly, the UI requires 250 points to draw a graph. The UI computes a 14s step (3600s/250). From there, the Querier computes the `max_resolution_window` parameter to be sent to stores as the requested step divided by 5 as stated in the [documentation](https://thanos.io/tip/components/query.md/#auto-downsampling). In this case it will be 2s. Which is much lower than the first 5m level downsamplig. No dowsampled data will be fetched.
+* **A one month range query**: The UI computes a 10368s (30d*24h*3600s/250) step. The querier sets the value of the `max_resolution_window` as 2074s (10368/5). This resolution is compatible with the 5m downsampled step (300s) but too low for the 1h downsampling (3600s). In this case, the store will return the 5m downsampled data.
+
+Considering that the raw data has a 15s samplig period, using the 5m downsampled data will reduce the number of samples by a factor of 20 (300s/15s) and the 1h downsampled data will reduce the number of samples by a factor of 240 (3600s/15s). This drastically improves the query performance of long range queries.
+
+#### Protecting from big queries
+
+The querier is not able to plan 
+
+Setting limits on stores, splitting ruler. WHAT IS THE QUERY LIMITS FOR?
+
+#### Speeding up queries evaluations 
+
+After having set caches for the store, you can also optimize the query component for faster query evaluations.
+
+
+
+<!-- Schema comparing both techniques -->
+
+### Wrapping Up: Navigating Thanos Configuration
+
+Through this exploration, I hope you've gained a clearer understanding of how to configure various Thanos components and the implications of certain options. While the Ruler component wasn't discussed to maintain the article's conciseness, it's worth noting that the Ruler also functions as a store for evaluated rules and contributes to pushing resulting blocks to object storage.
+
+There are numerous other significant aspects, such as multi-tenancy configuration and cache management, that we haven't delved into here. However, this guide should provide a solid foundation for getting started with Thanos, helping you comprehend its critical components and their interactions.
 
 ### Annexes
 
@@ -305,22 +376,3 @@ A **block** is a directory containing the chunk files in a specific time range, 
 The following schema illustrates the relationship between chunks, chunk files and blocks:
 
 <img src="img/life-of-a-sample/storage-terminology.png" alt="TSDB terminology" width="900"/>
-
-#### Configuration Options Summary
-
-Summary of the listed configuration options of the Receive component:
-
-| Flag | Purpose |
-| ---- | ---------- |
-| `--remote-write.address`
- `--remote-write.*` | The remote write endpoint |
-| `--receive.limits-config` | Limits on the remote write endpoint |
-| `--http-address`
-  `--receive.hashrings-algorithm` | The hashring |
-| `--receive.replication-factor`
-  `--receive.replica-header` | Replication of incoming data |
-| `--objstore.config` | Configuration of the object storage |
-| `--tsdb.retention`, `--tsdb.*` | Configuration of the local storage |
-| `--grpc-address` | The store API endpoint |
-| `--store.limits.request-samples`
-  `--store.limits.request-series` | Limits on the store API |
