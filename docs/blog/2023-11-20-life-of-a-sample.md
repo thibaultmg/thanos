@@ -53,6 +53,8 @@ The Prometheus remote-write configuration offers various parameters to tailor co
 
 Implementation-wise for Prometheus, the key idea is to read directly from the TSDB WAL (Write Ahead Log), a simple mechanism commonly used by databases to ensure data durability. If you wish to delve deeper into the TSDB WAL, check out this [great article](https://ganeshvernekar.com/blog/prometheus-tsdb-wal-and-checkpoint). Once samples are extracted from the WAL, they are aggregated into parallel queues (shards) as remote-write payloads. When a queue reaches its limit or a maximum timeout is attained, the remote-write client stops reading the WAL and dispatches the data. The cycle continues. The parallelism is defined by the number of shards, their number is dynamically optimized. More insights on Prometheus' remote write tuning can be found [here](https://prometheus.io/docs/practices/remote_write/).
 
+<img src="img/life-of-a-sample/remote-write.png" alt="Remote write" width="700"/>
+
 Key Points to Consider:
 
 * **Send deadline setting**: `batch_send_deadline` should be set to arround 5s to minimize latency. This timeframe strikes a balance between minimizing latency and avoiding excessive request frequency that could burden the receiver. While a 5-second delay might seem substantial in critical alert scenarios, it's generally acceptable considering the typical resolution time for most issues.
@@ -111,7 +113,7 @@ HOW DOES IT PLAYS WITH `--receive.replica-header`?
 
 #### Improving Scalability and Reliability
 
-To address the challenges in scalability and reliability, a new deployment topology was [proposed](https://thanos.io/tip/proposals-accepted/202012-receive-split.md/), separating the **router** and **ingestor** roles. Routers now manage the hashring, directing data to appropriate ingestors. This approach simplifies scaling and reduces downtime.
+To address the challenges in scalability and reliability, a new deployment topology was [proposed](https://thanos.io/tip/proposals-accepted/202012-receive-split.md/), separating the **router** and **ingestor** roles. Routers now manage the hashring, directing data to appropriate ingestors. This approach simplifies scaling and reduces downtime. DEVELOP.
 
 <img src="img/life-of-a-sample/router-and-ingestor.png" alt="IngestorRouter" width="350"/>
 
@@ -123,7 +125,7 @@ A key feature of Thanos is its ability to leverage economical object storage sol
 
 The Receive component is responsible for preparing data for object storage. Thanos adopts the TSDB (Time Series Database) data model, with some modifications, for its object storage. This involves aggregating samples over time to construct TSDB Blocks.
 
-These blocks are built by aggregating data over two-hour periods. The two-hour timeframe strikes a balance between timely data availability and manageable block sizes for efficient storage and retrieval. Once a block is ready, it's sent to the object storage, which is configured using the `--objstore.config` flag. This configuration is uniform across all components requiring object storage access.
+These blocks are built by aggregating data over two-hour periods. Once a block is ready, it's sent to the object storage, which is configured using the `--objstore.config` flag. This configuration is uniform across all components requiring object storage access.
 
 On restarts, the Receive component ensures data preservation by immediately flushing existing data to object storage, even if it doesn't constitute a full two-hour block. These partial blocks are less efficient but are later optimized by the compactor.
 
@@ -191,22 +193,53 @@ Finally you can configure how long you want to retain your data on object storag
 
 #### Exposing data for queries
 
-HOW DOES THE STORE KNOWS NEW BLOCKS ARE AVAILABLE? WHAT DELAY? SYNC MECHANISMS WITH THE RECEIVE> HOW TO AVOID THE SAME DATA BEING SERVED BY BOTH COMPONENTS?
+HOW DOES THE STORE KNOWS NEW BLOCKS ARE AVAILABLE? WHAT DELAY? SYNC MECHANISMS WITH THE RECEIVE
 
-The Store Gateway is acting as a facade for the object storage. It provides access to the bucket data through the Thanos Store API, which was previously mentioned in the context of the Receive component. The store exposes the store API with the `--grpc-address` flag.
+The Store Gateway is acting as a facade for the object storage, making bucket data accessible via the Thanos Store API, a feature first introduced with the Receive component. The store exposes the store API with the `--grpc-address` flag.
 
 The Store Gateway requires access to the object storage bucket to retrieve data, set with the `--objstore.config` flag. Additionally, it utilizes caches to efficiently store indexes and chunks of data.
 
-#### Efficient data retrieval with indexes and caches
+#### Retrieving samples from the object storage
 
-EXPLAIN HOW THE STORE RETRIEVES DATA REQUESTED ON THE STORE API. EXPLAIN METADATA USAGE, EXTERNAL LABELS, TIME RANGES, THEN INDEX, POSTINGS, THEN CHUNKS, THEN SAMPLES.
+Consider the simple following query done on the Querier:
 
-When a query comes in via the Store API, the Store Gateway:
+```promql
+# Between now and 2 days ago, compute the rate of http requests per second, filtered by method and status
+rate(http_requests_total{method="GET", status="200"}[5m])
+```
 
-* **Processes Metadata**: It first uses metadata to understand the external labels and time ranges relevant to the query.
-* **Accesses Indexes and Postings**: The Store Gateway then retrieves index and postings information to identify relevant data blocks.
-* **Fetches Chunks**: After identifying the relevant blocks, it fetches the corresponding chunks.
-* **Retrieves Samples**: Finally, it extracts the specific samples requested in the query.
+This PromQL query will be parsed by the Querier that will emit a Thanos [Store API](https://github.com/thanos-io/thanos/blob/main/pkg/store/storepb/rpc.proto) request to the Store Gateway with the following parameters:
+
+```proto
+SeriesRequest request = {
+  min_time: [Timestamp 2 days ago],
+  max_time: [Current Timestamp],
+  max_resolution_window: 1h,  // the minimum time range between two samples, relates to the downsampling levels
+  matchers: [
+    { name: "__name__", value: "http_requests_total", type: EQUAL },
+    { name: "method", value: "GET", type: EQUAL },
+    { name: "status", value: "200", type: EQUAL }
+  ]
+}
+```
+
+The Store Gateway processes this request in several steps:
+
+* **Metadata processing**: The Store Gateway first examines the block [metadata](https://thanos.io/tip/thanos/storage.md/#metadata-file-metajson) to determine the relevance of each block to the query. It evaluates the time range (`minTime` and `maxTime`) and external labels (`thanos.labels`). Blocks are deemed relevant if their timestamps overlap with the query's time range and if their resolution (`thanos.downsample.resolution`) matches the query's maximum allowed resolution.
+* **Index processing**: Next, the Gateway retrieves the [indexes](https://thanos.io/tip/thanos/storage.md/#index-format-index) of candidate blocks. This involves:
+  * Fetching postings lists for each label specified in the query. These are inverted indexes where each label and value has an associated sorted list of all the corresponding time series. Example:
+    * "__name__=http_requests_total": [1, 2, 3],
+    * "method=GET": [1, 2, 6],
+    * "status=200": [1, 2, 5]
+  * Intersecting these postings lists to pinpoint series that match all query labels. In our example these are series 1 and 2.
+  * Retrieving the Series section from the index for these series, which includes chunk information and their time ranges. Example:
+    * Series 1: [Chunk 1: mint=t0, maxt=t1, fileRef=0001, offset=0], ...
+  * Determining the relevant chunks based on their time range intersection with the query.
+* **Chunks retrieval**: The Gateway then fetches the appropriate chunks, either from the object storage directly or from a chunk cache. When retrieving from the object store, the Gateway leverages its API to read only the needed bytes (e.g. using S3 range requests), bypassing the need to download entire chunk files.
+
+Understanding the retrieval algorithm highlights the critical role of an external [index cache](https://thanos.io/tip/components/store.md/#index-cache) in the Store Gateway's operation. This is configured using the `--index-cache.config` flag. Indexes contain all labels and values of the block which can result in big sizes. When the cache is full, Last-In-First-Out (LIFO) eviction is applied. In scenarios where no external cache is configured, a portion of the memory will be utilized as a cache, managed via the `--index-cache.size` flag.
+
+Moreover, the direct retrieval of chunks from object storage can be suboptimal, and result in excessive costs, especially with a high volume of queries. To mitigate this, employing a [caching bucket](https://thanos.io/tip/components/store.md/#caching-bucket) can significantly reduce the number of queries to the object storage. This chunk caching strategy is particularly effective when data access patterns are predominantly focused on recent data. By caching these frequently accessed chunks, query performance is enhanced, and the load on object storage is reduced.
 
 #### Distributing the load with sharding
 
