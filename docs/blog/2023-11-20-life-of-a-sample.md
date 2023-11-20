@@ -161,35 +161,39 @@ The Compactor component is responsible for maintaining and optimizing data in ob
 
 #### Compaction modes
 
-Compaction consist in merging blocks that have overlapping time ranges. This is called **horizontal compaction** Using the Metadata file that contains the minimum and maximum timestamp of samples in the block, the compactor can determine if two blocks overlap. If they do, they are merged into a new block. This new block will have its compaction level index increased by one. So from two blocks of 2 hours each having a small overlap, we will get a new block of 4 hours. 
+Compaction consist in merging blocks that have overlapping or adjacent time ranges. This is called **horizontal compaction** Using the Metadata file that contains the minimum and maximum timestamp of samples in the block, the compactor can determine if two blocks overlap. If they do, they are merged into a new block. This new block will have its compaction level index increased by one. So from two adjacent blocks of 2 hours, we will get a new block of 4 hours. 
 
 During this compaction, the compactor will also deduplicate samples. This is called **vertical compaction**. The compactor provides two deduplication modes:
 
 * `one-to-one`: This is the default mode. It will deduplicate samples that have the same timestamp and the same value. But different replica label values. The replica label is configured by the `--deduplication.replica-label` flag REALLY?. Usually set to `replica`, make sure it is set up as external label on the receivers. The benefit of this mode is that it is straightforward and will remove replicated data from the receive. However, it is not able to remove data replicated by high availability prometheus setups. Because, these samples will rarely be scraped at exactly the same timestamps.
 * `penalty`: This a more complex deduplication algorithm that is able to deduplicate data coming from high availability prometheus setups. It can be set with the `--deduplication.func` flag and requires also setting the `--deduplication.replica-label` flag that identifies the label that contains the replica label. Usually `prometheus_replica`. Here is a schema illustrating how Prometheus replicas generate samples with different timestamps that cannot be deduplicated with the `one-to-one` mode:
 
-<img src="img/life-of-a-sample/ha-prometheus-duplicates.png" alt="High availability prometheus duplication" width="400"/>
+<img src="img/life-of-a-sample/ha-prometheus-duplicates.png" alt="High availability prometheus duplication" width="500"/>
 
 Getting back to our example illustrating the data duplication happening in the object storage, here is how each compaction process will impact the data:
 
-<img src="img/life-of-a-sample/compactor-compaction.png" alt="Compactor compaction" width="400"/>
+<img src="img/life-of-a-sample/compactor-compaction.png" alt="Compactor compaction" width="700"/>
 
 
 You want to deduplicate data as much as possible because it will lower your object storage cost and improve query performance. But using the penalty presents some limitations. Have a look at (https://thanos.io/tip/components/compact.md/#vertical-compaction-risks)
-
-#### The compactor UI and the block streams
-
-The Compactor's operation can be monitored via the Block Viewer UI, accessible through a web interface configured with the `--http-address` flag. Additional UI settings are controlled via `--web.*` and `--block-viewer.*` flags. Here is how it looks like:
-
-EXPLAIN DATA STREAMS
-
-<!-- Print screen with overlay explaining -->
 
 #### Downsampling and retention
 
 The compactor is also optimizing data read for long range queries. If you are querying data for several months, you don't need the typical 15s raw resolution. Processing such a query will be very inefficient as it will retrieve a lot of unnecessary data. To enable performant long range queries, the compactor can downsample data. It supports two downsampling levels: 5m and 1h. These are the resolution of the downsamples series. They will tipically come on top of the raw data, so that you can have both raw and downsampled data. We'll see later how to configure the query to use the downsampled data.
 
 Finally you can configure how long you want to retain your data on object storage. One flag `--retention.resolution-*` for each resolution is available. We recommand having the same value for each. 
+
+#### The compactor UI and the block streams
+
+All blocks covering the same time range are not compacted together. Instead, the Compactor organizes them into distinct [compaction groups or block streams](https://thanos.io/tip/components/compact.md/#compaction-groups--block-streams). The key here is to leverage external labels to group data originating from the same source. This strategic grouping is particularly effective for compacting indexes, as blocks from the same source tend to have nearly identical labels.
+
+The Compactor's functionality and the progress of its operations can be monitored through the Block Viewer UI. This web-based interface is accessible if the Compactor is configured with the `--http-address` flag. Additional UI settings are controlled via `--web.*` and `--block-viewer.*` flags. The Compactor UI provides a visual representation of the compaction process, showing how blocks are grouped and compacted over time. Here’s a glimpse of what the UI looks like:
+
+<img src="img/life-of-a-sample/compactor-ui.png" alt="Receive and Store data overlap" width="800"/>
+
+Occasionally, some blocks may display an artificially low level in the UI, appearing lower in the stream compared to adjacent blocks. This scenario often occurs in situations like rolling receiver upgrades, where receivers restart sequentially, leading to the creation and upload of partial blocks to the object store. The Compactor then vertically compacts these blocks as they arrive, resulting in a temporary increase in compaction levels. When these blocks are horizontally compected with adjactent blocks, they will also be displayed lower down the stream.
+
+By default, the Compactor’s strategy involves compacting 2-hour blocks into 8-hour blocks once they are available, then progressing to 2-day blocks, and so on, following a structured compaction timeline.
 
 ### Exposing buckets data for queries: the store gateway and the store API
 
@@ -283,7 +287,7 @@ Thanos stores, comprising the Receive component for recent data and the Store Ga
 
 To prevent data overlap between the Receive component (handling data up to its TSDB retention period) and the Store Gateway (handling blocks exported to the object store), the `--max-time` flag is used in the Store Gateway. This flag ensures the Store Gateway does not serve data too recent and already covered by the Receive. However, a slight overlap is necessary to prevent data gaps:
 
-<!-- schema -->
+<img src="img/life-of-a-sample/data-overlap.png" alt="Receive and Store data overlap" width="400"/>
 
 #### Deduplication and Partial Response Handling
 
