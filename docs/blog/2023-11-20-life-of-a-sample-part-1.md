@@ -8,7 +8,7 @@ author: Thibault Mangé (https://github.com/thibaultmg)
 
 ### Introduction
 
-Thanos is a sophisticated distributed system with a broad range of capabilities, and with that comes a certain level of configuration intricacies. In this article, we'll take a deep dive into the lifecycle of a sample within Thanos, tracking its journey from initial ingestion to final retrieval. Our focus will be to explain Thanos' critical internal mechanisms and pinpoint the essential configurations for each component, guiding you to achieve the operational results you're aiming for. We'll be covering the following thanos components:
+Thanos is a sophisticated distributed system with a broad range of capabilities, and with that comes a certain level of configuration intricacies. In this series of articles, we'll take a deep dive into the lifecycle of a sample within Thanos, tracking its journey from initial ingestion to final retrieval. Our focus will be to explain Thanos' critical internal mechanisms and pinpoint the essential configurations for each component, guiding you to achieve the operational results you're aiming for. We'll be covering the following thanos components:
 
 * **Receive**: Ingests samples from Prometheus servers and prepares them for object storage.
 * **Compactor**: Merges and deduplicates blocks in object storage.
@@ -16,7 +16,7 @@ Thanos is a sophisticated distributed system with a broad range of capabilities,
 * **Query**: Retrieves data from stores and processes queries.
 * **Query Frontend**: Distributes queries to query instances.
 
-The objective of this article is to make Thanos more accessible to new users, helping to alleviate any initial apprehensions. We'll also assume that the working environment is Kubernetes. Given the extensive ground to cover, we'll aim to maintain conciseness throughout our exploration.
+The objective of this series of articles is to make Thanos more accessible to new users, helping to alleviate any initial apprehensions. We'll also assume that the working environment is Kubernetes. Given the extensive ground to cover, we'll aim to maintain conciseness throughout our exploration.
 
 Before diving deeper, please check annexes to clarify some essential terminology. If you're already familiar with these concepts, feel free to skip ahead.
 
@@ -129,7 +129,7 @@ A new deployment topology was [proposed](https://thanos.io/tip/proposals-accepte
 
 ### Conclusion
 
-In this first part, we've covered the initial steps of the sample lifecycle in Thanos, focusing on the ingestion process. We've explored the remote write protocol, the Receive component, and the critical configurations needed to ensure high availability and durability. In the next part, we'll continue following our sample's journey, delving into the data management and querying processes. 
+In this first part, we've covered the initial steps of the sample lifecycle in Thanos, focusing on the ingestion process. We've explored the remote write protocol, the Receive component, and the critical configurations needed to ensure high availability and durability. Now, our sample is safely ingested and stored in the object store. In the next part, we'll continue following our sample's journey, delving into the data management and querying processes.
 
 See the full list of articles in this series:
 
