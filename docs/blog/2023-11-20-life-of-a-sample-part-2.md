@@ -8,10 +8,7 @@ author: Thibault Mangé (https://github.com/thibaultmg)
 
 ### Introduction
 
-In the [first part]() of this series, we followed the life of a sample from its inception in a Prometheus server beyond our network boundaries to our object storage. From this phase, several questions arise:
-
-* How can Thanos optimize the storage of all the data it ingests?
-* How does it expose the data ingested into the object store for fast and low-cost retrieval?
+In the [first part](2023-11-20-life-of-a-sample-part-1.md) of this series, we followed the life of a sample from its inception in a Prometheus server located beyond our network boundaries to our Thanos Receivers. We will now explore how Thanos manages the data ingested by the Receivers and optimizes data in the object store for reduced cost and fast retrieval.
 
 Let's delve into these topics and more in the second part of the series.
 
@@ -21,29 +18,40 @@ Let's delve into these topics and more in the second part of the series.
 
 A key feature of Thanos is its ability to leverage economical object storage solutions like AWS S3 for long-term data retention. This contrasts with Prometheus's typical approach of storing data locally for shorter periods.
 
-The Receive component is responsible for preparing data for object storage. Thanos adopts the TSDB (Time Series Database) data model, with some modifications, for its object storage. This involves aggregating samples over time to construct TSDB Blocks. Please refer to the annexes of the first part if this vocabulary is not clear for you.
+The Receive component is responsible for preparing data for object storage. Thanos adopts the TSDB (Time Series Database) data model, with some adaptations, for its object storage. This involves aggregating samples over time to construct TSDB Blocks. Please refer to the annexes of the [first part](2023-11-20-life-of-a-sample-part-1.md) if this vocabulary is not clear for you.
 
 These blocks are built by aggregating data over two-hour periods. Once a block is ready, it is sent to the object storage, which is configured using the `--objstore.config` flag. This configuration is uniform across all components requiring object storage access.
 
-On restarts, the Receive component ensures data preservation by immediately flushing existing data to object storage, even if it doesn't constitute a full two-hour block. These partial blocks are less efficient but are later optimized by the compactor.
+On restarts, the Receive component ensures data preservation by immediately flushing existing data to object storage, even if it doesn't constitute a full two-hour block. These partial blocks are less efficient but are later optimized by the compactor as we'll see later.
+
+The receive also allows to [isolate ingested data](https://thanos.io/tip/components/receive.md/#tenant-lifecycle-management) coming from different tenants. The tenant can be identified in the request by different means: a header (`--receive.tenant-header`), a label (`--receive.split-tenant-label-name`) or a certificate (`--receive.tenant-certificate-field`). Their data is ingested into different TSDBs instances (you'll hear about the multiTSDB). The benefits are twofold:
+
+* It allows for parallelization of the block building process, especially on the compactor side as we'll see later.
+* It allows for smaller indexes. Indeed, labels tend to be similar for samples coming from the same source, leading to more effective compression.
+
+<img src="img/life-of-a-sample/multi-tsdb.png" alt="Data expansion" width="400"/>
+
+When a block is ready, it is uploaded to the object storage with the block external label defined by the flag `--receive.tenant-label-name`. This corresponds to the `thanos.labels` field of the [block metadata](https://thanos.io/tip/thanos/storage.md/#metadata-file-metajson). This will be used advantageously by the Compactor to group blocks together as we'll see later.
 
 #### Exposing local data for queries
 
-During the block-building phase, the data isn't accessible to the store gateway. Hence, the Receive component also serves as a data store, making the local data available to queriers through the store API. This is a common gRPC API used across all Thanos components for time series data access, set with the `--grpc-address` flag. The receive will serve all data is has. The more data it serves, the more resources it will use for this duty in addition of ingesting client's data. WHY WOULD WE SERVE MORE THAN 2H OF DATA? The amount of data the Receive component serves can be managed through two parameters:
+During the block-building phase, the data isn't accessible to the Store Gateway as it has not been uploaded to the object store yet. Hence, the Receive component also serves as a data store, making the local data available for query through the `Store API`. This is a common gRPC API used across all Thanos components for time series data access, set with the `--grpc-address` flag. The receive will serve all data is has. The more data it serves, the more resources it will use for this duty in addition of ingesting client's data. 
+
+<img src="img/life-of-a-sample/receive-store-api.png" alt="Data expansion" width="400"/>
+
+The amount of data the Receive component serves can be managed through two parameters:
 
 * `--tsdb.retention`: Sets the local storage retention duration. The minimum is 2 hours, aligning with block construction periods.
-* `--store.limits.request-samples` and `--store.limits.request-series`: These limit the volume of data that can be queried. Exceeding these limits will result in the query being TRUNCATED OR DENIED??, ensuring system stability. WHAT HAPPENS TO thE ORIGINAL QUERY?
+* `--store.limits.request-samples` and `--store.limits.request-series`: These limit the volume of data that can be queried. Exceeding these limits will result in the query being TRUNCATED OR DENIED??, ensuring system stability. 
 
-#### Handling Out-of-Order Timestamps
+Key points to consider:
 
-Issues can arise when clients send data with out-of-order timestamps, often due to unsynchronized clocks or more complex client setups with several prometheusis handling the same target. Explain `--receive.max-block-duration`, WHAT TRADEOFFS?. SCHEMA 
-
+* The primary objective of the receive is to ensure reliable data ingestion. And the more data it serves through the store API, the more resources it will use for this duty in addition to ingesting client data. You should set the retention duration to the minimum required for your use case to optimize resources allocation. The minimum value for 2 hours blocks would be 4 hours retention to account for availability in the store Gateway after the block is uploaded to object storage.
+* Even when the retention duration is short, your receive instance could be averwhelmed by a query selecting too much data. You should set limits in place to ensure the stability of the receive instances. These limits must be carefully set to enable store API clients to retrieve the data they need while preventing resource exhaustion.
 
 ### Maintaining data: compaction, downsampling, and retention
 
 #### The need for compaction
-
-HOW DOES THE COMPACTOR DETECTS NEW BLOCKS? HOW LONG BEFORE A NEW BLOCK IS PROCESSED?
 
 The Receive component implements many strategies to ingest samples reliably. However this can result in unoptimized data in object storage. This is due to:
 
@@ -51,19 +59,23 @@ The Receive component implements many strategies to ingest samples reliably. How
 * Duplicated data when replication is set.  Several Receive instances will send the same data to object storage.
 * Incompete blocks (invalid blocks) sent to object storage when the receive fails in the middle of an upload.
 
-The following schema illustrates the impact on data expansion (6 times) in object storage when samples from a given target are ingested from a high availabity prometheus setup (with 2 instances) and repliacation (factor 3) is set on the receive:
+The following schema illustrates the impact on data expansion in object storage when samples from a given target are ingested from a high availabity prometheus setup (with 2 instances) and replication is set on the receive (factor 3):
 
 <img src="img/life-of-a-sample/data-expansion.png" alt="Data expansion" width="400"/>
 
+This leads to a 6 times increase in data volume! This is where the Compactor comes into play.
+
 The Compactor component is responsible for maintaining and optimizing data in object storage. It's a long-running process that can be configured to wait for new blocks with the `--wait` flag. It also needs access to the object storage with the `--objstore.config` flag.
+
+Under normal operation conditions, the Compactor will check for new blocks every 5 minutes. It will then process these blocks in a structured manner, compacting them according to defined settings that we'll see in the next sections.
 
 #### Compaction modes
 
-Compaction consist in merging blocks that have overlapping or adjacent time ranges. This is called **horizontal compaction** Using the Metadata file that contains the minimum and maximum timestamp of samples in the block, the compactor can determine if two blocks overlap. If they do, they are merged into a new block. This new block will have its compaction level index increased by one. So from two adjacent blocks of 2 hours, we will get a new block of 4 hours. 
+Compaction consists in merging blocks that have overlapping or adjacent time ranges. This is called **horizontal compaction**. Using the [Metadata file](https://thanos.io/tip/thanos/storage.md/#metadata-file-metajson) that contains the minimum and maximum timestamp of samples in the block, the compactor can determine if two blocks overlap. If they do, they are merged into a new block. This new block will have its compaction level index increased by one. So from two adjacent blocks of 2 hours, we will get a new block of 4 hours. 
 
-During this compaction, the compactor will also deduplicate samples. This is called **vertical compaction**. The compactor provides two deduplication modes:
+During this compaction, the compactor will also deduplicate samples. This is called [vertical compaction](https://thanos.io/tip/components/compact.md/#vertical-compactions). The compactor provides two deduplication modes:
 
-* `one-to-one`: This is the default mode. It will deduplicate samples that have the same timestamp and the same value. But different replica label values. The replica label is configured by the `--deduplication.replica-label` flag REALLY?. Usually set to `replica`, make sure it is set up as external label on the receivers. The benefit of this mode is that it is straightforward and will remove replicated data from the receive. However, it is not able to remove data replicated by high availability prometheus setups. Because, these samples will rarely be scraped at exactly the same timestamps.
+* `one-to-one`: This is the default mode. It will deduplicate samples that have the same timestamp and the same value. But different replica label values. The replica label is configured by the `--deduplication.replica-label` flag. This flag can be repeated to account for several replication labels. Usually set to `replica`, make sure it is set up as external label on the Receivers with the flag `--label=replica=xxx`. The benefit of this mode is that it is straightforward and will remove replicated data from the receive. However, it is not able to remove data replicated by high availability prometheus setups. Because, these samples will rarely be scraped at exactly the same timestamps.
 * `penalty`: This a more complex deduplication algorithm that is able to deduplicate data coming from high availability prometheus setups. It can be set with the `--deduplication.func` flag and requires also setting the `--deduplication.replica-label` flag that identifies the label that contains the replica label. Usually `prometheus_replica`. Here is a schema illustrating how Prometheus replicas generate samples with different timestamps that cannot be deduplicated with the `one-to-one` mode:
 
 <img src="img/life-of-a-sample/ha-prometheus-duplicates.png" alt="High availability prometheus duplication" width="500"/>
@@ -77,9 +89,15 @@ You want to deduplicate data as much as possible because it will lower your obje
 
 #### Downsampling and retention
 
-The compactor is also optimizing data read for long range queries. If you are querying data for several months, you don't need the typical 15s raw resolution. Processing such a query will be very inefficient as it will retrieve a lot of unnecessary data. To enable performant long range queries, the compactor can downsample data. It supports two downsampling levels: 5m and 1h. These are the resolution of the downsamples series. They will tipically come on top of the raw data, so that you can have both raw and downsampled data. We'll see later how to configure the query to use the downsampled data.
+The compactor is also optimizing data read for long range queries. If you are querying data for several months, you don't need the typical 15s raw resolution. Processing such a query will be very inefficient as it will retrieve a lot of unnecessary data that you won't be able to visualize with such details in your UI. And it may even in worst case scenarios kill some components of your Thanos setup due to memory exhaustion.
 
-Finally you can configure how long you want to retain your data on object storage. One flag `--retention.resolution-*` for each resolution is available. We recommand having the same value for each. 
+To enable performant long range queries, the compactor can downsample data using `--retention.resolution-*` flags. It supports two downsampling levels: 5m and 1h. These are the resolutions of the downsamples series. They will tipically come on top of the raw data, so that you can have both raw and downsampled data. It will enable you to spot abnormal patterns over lang range queries and then zoom into specific parts thanks to the raw data. We'll see later how to configure the query to use the downsampled data.
+
+Key points to consider:
+
+* Downsampling if not for reducing the volume of data in object storage. It is for improving lang range query performance, making your system more versatile and stable.
+* Thanos recommends having the same retention duration for raw and downsampled data. This will enable you to have a consistent view of your data over time.
+* As a rules of thumb, you can consider that each downsampled data increases one fold the storage need. Most often less than that, but depending on your data, plan for the worst case.
 
 #### The compactor UI and the block streams
 
