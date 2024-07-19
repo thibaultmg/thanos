@@ -127,9 +127,33 @@ A new deployment topology was [proposed](https://thanos.io/tip/proposals-accepte
 
 <img src="img/life-of-a-sample/router-and-ingestor.png" alt="IngestorRouter" width="350"/>
 
+<!-- TODO: Add configuration details? -->
+
+#### Handling Out-of-Order Timestamps
+
+To enhance reliability in data ingestion, Thanos Receive supports out-of-order samples.
+
+Samples are ingested into the Receiver's TSDB, which has strict requirements for the order of timestamps:
+
+Samples are expected to have increasing timestamps for a given timeseries.
+A new sample cannot be more than 1 hour older than the most recent sample of any timeseries in the TSDB.
+When these requirements are not met, the samples are dropped, and an out-of-order warning is logged. However, there are scenarios where out-of-order samples may occur. Here are two common examples:
+
+* Delayed remote write requests can cause samples to arrive out of order, depending on the remote write implementation.
+* A client experiencing an outage of more than an hour and then catching up can send samples out of order.
+
+Additional examples at the Prometheus level can be found in [this article](https://promlabs.com/blog/2022/12/15/understanding-duplicate-samples-and-out-of-order-timestamp-errors-in-prometheus/).
+
+To increase resilience against these issues, support for out-of-order samples has been proposed and implemented for the TSDB. This feature can be enabled with the `tsdb.out-of-order.time-window` flag on the Receiver. The downsides are: 
+
+* An increase of the TSDB's memory usage, proportional to the number of out-of-order samples. 
+* The TSDB will produce blocks with overlapping time periods, which the compactor must handle. Ensure the `--compact.enable-vertical-compaction` [flag](https://thanos.io/tip/components/compact.md/#enabling-vertical-compaction) is enabled on the compactor to manage these overlapping blocks.
+
+Additionally, consider setting the tsdb.too-far-in-future.time-window flag to a value higher than the default 0s to account for possible clock drifts between clients and the receiver.
+
 ### Conclusion
 
-In this first part, we've covered the initial steps of the sample lifecycle in Thanos, focusing on the ingestion process. We've explored the remote write protocol, the Receive component, and the critical configurations needed to ensure high availability and durability. Now, our sample is safely ingested and stored in the object store. In the next part, we'll continue following our sample's journey, delving into the data management and querying processes.
+In this first part, we've covered the initial steps of the sample lifecycle in Thanos, focusing on the ingestion process. We've explored the remote write protocol, the Receive component, and the critical configurations needed to ensure high availability and durability. Now, our sample is safely ingested and stored in our system. In the next part, we'll continue following our sample's journey, delving into the data management and querying processes.
 
 See the full list of articles in this series:
 
