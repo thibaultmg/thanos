@@ -67,7 +67,7 @@ This leads to a 6 times increase in data volume! This is where the Compactor com
 
 The Compactor component is responsible for maintaining and optimizing data in object storage. It's a long-running process that can be configured to wait for new blocks with the `--wait` flag. It also needs access to the object storage with the `--objstore.config` flag.
 
-Under normal operation conditions, the Compactor will check for new blocks every 5 minutes. It will then process these blocks in a structured manner, compacting them according to defined settings that we'll see in the next sections.
+Under normal operation conditions, the Compactor will check for new blocks every 5 minutes. It will then process these blocks in a structured manner, compacting them according to defined settings that we'll see in the next sections. To avoid reading partially written blocks, the compactor waits...
 
 #### Compaction modes
 
@@ -85,7 +85,17 @@ Getting back to our example illustrating the data duplication happening in the o
 <img src="img/life-of-a-sample/compactor-compaction.png" alt="Compactor compaction" width="700"/>
 
 
-You want to deduplicate data as much as possible because it will lower your object storage cost and improve query performance. But using the penalty presents some limitations. Have a look at (https://thanos.io/tip/components/compact.md/#vertical-compaction-risks)
+You want to deduplicate data as much as possible because it will lower your object storage cost and improve query performance. But using the penalty presents some limitations. Have a look at (https://thanos.io/tip/components/compact.md/#vertical-compaction-risks).
+
+Key points to consider:
+
+* You want blocks that are not too big because they will be slow to query. But you also want to limit the number of blocks because it will increase the number of requests to the object storage. Also, the more block the less compaction and the more data to store and load in memory. 
+* You don't need to worry about too small blocks as the compactor will merge them together. But you could have too big blocks. This can happen if you have very high cadinality workloads. Or churn-heavy workloads like CI runs, build pipelines, serverless or batchjob, which often lead to huge cardinality explosions.
+* The main solution to this is splitting the data into several block streams as we'll set later. This is Thamos' sharding strategy.
+* If you don't have this possibility, in last resort,....
+* There are cases where you might want to limit the size of the blocks. To that effect, you can use the following parameters:
+* You can limit the compaction levels with `--debug.max-compaction-level` to avoid the compactor to create blocks that are too big. This is especially useful when you have a hich metrics churn rate. Level 1 is the default and will create blocks of 2 hours. Level 2 will create blocks of 8 hours, level 3 of 2 days, and so on. Without this limit, the compactor will create blocks of up to 2 weeks. This is not a magic bullet, it does not limit the data of the blocks. It just limits the number of blocks that can be merged together. The downside of using this setting is that it will increase the number of blocks in the object storage, they will use more space and the query performance might be impacted.
+* The flag `compact.block-max-index-size` can be used more efficiently. It has a default value of 64GB. At this stage, the block is marked for no compaction.
 
 #### Downsampling and retention
 
@@ -186,5 +196,4 @@ After having optimized the store processing, you can distribute the queries load
 In this configuration, the `hashmod` action is used to distribute blocks across multiple Store instances (replicas) based on the `__block_id` label. The `modulus` should match the number of Store replicas you have. Each replica will then keep only the blocks that match its shard number, as defined by the `regex` in the `keep` action. This setup allows for a more balanced distribution of query processing, enhancing overall system performance. 
 
 However, this sharding approach isn't a universal solution. One potential issue comes from the fact that series are grouped within a block based on their external labels, typically originating from the same data source. In such cases, if the load is predominantly from one source, sharding may be less effective. This is especially true for blocks that have undergone horizontal compaction and cover extensive time ranges, potentially resulting in an uneven query load on a single Store instance. OTHER SOLUTION? ADD RANDOM SET OF EXTERNAL LABELS AT THE SERIES LEVEL TO INCREASE THE NUMBER OF STREAMS?
-
 
